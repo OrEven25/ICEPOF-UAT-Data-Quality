@@ -1,0 +1,21 @@
+# Real trading data — never committed, downloaded fresh each run
+data/
+output/
+dashboard_project/
+test_download/
+
+# Proprietary CubeLogic source (research reference only, not needed at runtime)
+reference_data/*.cs
+
+# Secrets
+.sas_token_scratch
+*.env
+
+# Ad hoc scratch scripts used during development
+test_*.py
+investigate_*.py
+explore_*.py
+peek_body.py
+
+__pycache__/
+*.pyc
