@@ -593,11 +593,19 @@ def build_expected_rows(exec_df: pd.DataFrame, secdef_index: dict, uds_index: di
         if len(row_variants) == 1:
             trade_variant = row_variants[0]
         else:
+            # DELIVERY_PERIOD="TIME_SPREAD" / TRAN_INS_TYPE="SP" (rather than the strategy
+            # instrument's own fields) inferred from 100% of actual 2026-07-14 CLIENT_TRADES
+            # rows for multi-leg UDS trades matching this pair of literal values (e.g.
+            # ORIG_TRAN_ID 11000006018842) — not confirmed against TradeMapper.cs source.
             trade_variant = {
-                "secdef": link["secdef"], "uds": uds_pm, "dp_override": None, "side": 0,
+                "secdef": link["secdef"], "uds": uds_pm, "dp_override": "TIME_SPREAD", "side": 0,
+                "tran_ins_type_override": "SP",
                 "notes": ["multileg_uds_trade_not_leg_split: TradeMapper writes one row per "
                           "execution report regardless of leg count, unlike OrderMapper — "
                           "inferred from actual CLIENT_TRADES row counts, not confirmed "
+                          "against TradeMapper.cs source",
+                          "multileg_uds_trade_spread_type: TRAN_INS_TYPE=SP / DELIVERY_PERIOD="
+                          "TIME_SPREAD inferred from actual CLIENT_TRADES values, not confirmed "
                           "against TradeMapper.cs source"],
             }
 
@@ -605,7 +613,12 @@ def build_expected_rows(exec_df: pd.DataFrame, secdef_index: dict, uds_index: di
             secdef_entry = variant["secdef"]
             inst = _instrument_ref_fields(secdef_entry, variant["uds"], ref)
             delivery_period = variant["dp_override"] or convert_delivery_period(inst["strip_name"], today)
-            tran_ins_type, tran_ins_type_override = derive_tran_ins_type(secdef_entry, ref, s.get(828))
+            if variant.get("tran_ins_type_override"):
+                tran_ins_type, tran_ins_type_override = variant["tran_ins_type_override"], False
+                if (s.get(828) or "").upper() == "K":
+                    tran_ins_type = f"BL_{tran_ins_type}"
+            else:
+                tran_ins_type, tran_ins_type_override = derive_tran_ins_type(secdef_entry, ref, s.get(828))
             notes = list(variant["notes"])
             if tran_ins_type_override:
                 notes.append("tran_ins_type_override_applied: code-observed ProductID override table, not in spec 5.1.3 text")
