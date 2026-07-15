@@ -500,6 +500,33 @@ def build_expected_rows(exec_df: pd.DataFrame, secdef_index: dict, uds_index: di
 
     ordered = exec_df.sort_values(["ReceivedAtUtc", "SequenceNumber"])
 
+    # Drop retransmitted execution reports before building anything: ICE resends the
+    # identical business event over a backup FIX session after a session failover
+    # (tag 97=PossResend=Y observed; same ExecID/tag 17 and same trade/order economics,
+    # only the session envelope — 34/52/56/57/9/10 — differs). Confirmed on 2026-07-14
+    # data (e.g. ORIG_TRAN_ID 11000006018842): left undeduped, each resend was counted
+    # as a second independent event, inflating expected row counts. ExecID is one-to-one
+    # with a specific execution event per spec 5.2, so a repeat is a retransmission, not
+    # a new event — keep only the first-arriving copy. Messages without tag 17 (should
+    # not occur for Execution Reports, but guard anyway) are never deduped.
+    seen_exec_ids: set[str] = set()
+    keep_mask: list[bool] = []
+    for pm in ordered["ParsedMessage"]:
+        exec_id = pm.scalar.get(17)
+        if exec_id is None:
+            keep_mask.append(True)
+            continue
+        if exec_id in seen_exec_ids:
+            keep_mask.append(False)
+            diagnostics.append({
+                "tag11": pm.scalar.get(11),
+                "reason": f"excluded: duplicate ExecID (tag17={exec_id}) — resend/retransmission of an already-processed execution report",
+            })
+        else:
+            seen_exec_ids.add(exec_id)
+            keep_mask.append(True)
+    ordered = ordered[keep_mask]
+
     for pm in ordered["ParsedMessage"]:
         s = pm.scalar
         tag11 = s.get(11)
@@ -519,10 +546,11 @@ def build_expected_rows(exec_df: pd.DataFrame, secdef_index: dict, uds_index: di
         uds_pm = link["uds"]
         is_known_uds = link["is_known_uds"]
 
-        # Build the row-set for this execution report: normally one row, but a UUDS
-        # (non-KUDS UDS match) fans out into multiple leg rows, unless the legs form
-        # a complete quarter or year (collapsed back to one row) or a seasonal UDS
-        # (also single row, per IsSeasonalUds).
+        # Build the row-set for ORDERS on this execution report: normally one row, but a
+        # UUDS (non-KUDS UDS match) fans out into multiple leg rows, unless the legs form
+        # a complete quarter or year (collapsed back to one row) or a seasonal UDS (also
+        # single row, per IsSeasonalUds). This leg-split fan-out is OrderMapper-specific —
+        # see trade_variant below, which never leg-splits.
         row_variants: list[dict] = []  # each: {secdef_entry, uds_pm, delivery_period_override, side, notes}
 
         if uds_pm is not None and not is_known_uds:
@@ -554,7 +582,26 @@ def build_expected_rows(exec_df: pd.DataFrame, secdef_index: dict, uds_index: di
             diagnostics.append({"tag11": tag11, "reason": "UUDS leg-split produced zero resolvable legs"})
             continue
 
-        for variant in row_variants:
+        # Trades never leg-split, regardless of the ORDERS fan-out above: a multi-leg UDS
+        # trade is booked as exactly one CLIENT_TRADES row against the strategy-level
+        # instrument (not per leg). row_variants only ever has >1 entries in the UUDS
+        # leg-split branch above — every other branch (plain instrument, seasonal UDS,
+        # full-quarter/full-year collapse) already produces a single variant, which is
+        # reused as-is. Inferred from actual CLIENT_TRADES row counts on multi-leg UDS
+        # trades (e.g. ORIG_TRAN_ID 11000006018842, a 2-leg Sep26/Oct26 spread: actual=1)
+        # — not independently re-confirmed against TradeMapper.cs source, hence the note.
+        if len(row_variants) == 1:
+            trade_variant = row_variants[0]
+        else:
+            trade_variant = {
+                "secdef": link["secdef"], "uds": uds_pm, "dp_override": None, "side": 0,
+                "notes": ["multileg_uds_trade_not_leg_split: TradeMapper writes one row per "
+                          "execution report regardless of leg count, unlike OrderMapper — "
+                          "inferred from actual CLIENT_TRADES row counts, not confirmed "
+                          "against TradeMapper.cs source"],
+            }
+
+        def _base_row(variant):
             secdef_entry = variant["secdef"]
             inst = _instrument_ref_fields(secdef_entry, variant["uds"], ref)
             delivery_period = variant["dp_override"] or convert_delivery_period(inst["strip_name"], today)
@@ -562,8 +609,7 @@ def build_expected_rows(exec_df: pd.DataFrame, secdef_index: dict, uds_index: di
             notes = list(variant["notes"])
             if tran_ins_type_override:
                 notes.append("tran_ins_type_override_applied: code-observed ProductID override table, not in spec 5.1.3 text")
-
-            base_row = {
+            return {
                 "_tag11": tag11,
                 "ORIG_TRAN_ID": orig_tran_id,
                 "COUNTRY": inst["country"], "_country_step": inst["country_step"],
@@ -585,10 +631,13 @@ def build_expected_rows(exec_df: pd.DataFrame, secdef_index: dict, uds_index: di
                 "_notes": notes,
             }
 
-            tag9175 = s.get(9175)
-            tran_status_order = TRAN_STATUS_ORDERS.get(exec_type, "C") if tag9175 in ("0", "4", "5", "6") else "C"
+        tag9175 = s.get(9175)
+        tran_status_order = TRAN_STATUS_ORDERS.get(exec_type, "C") if tag9175 in ("0", "4", "5", "6") else "C"
 
-            if exec_type in ORDERS_EXEC_TYPES:
+        if exec_type in ORDERS_EXEC_TYPES:
+            for variant in row_variants:
+                base_row = _base_row(variant)
+                secdef_entry = variant["secdef"]
                 prev_vol = previous_volume_cache.get(orig_tran_id)
                 vol = _volume_for_order(s, tran_status_order, prev_vol)
                 previous_volume_cache[orig_tran_id] = vol
@@ -603,29 +652,30 @@ def build_expected_rows(exec_df: pd.DataFrame, secdef_index: dict, uds_index: di
                 })
                 expected_orders.append(order_row)
 
-            if exec_type in TRADES_EXEC_TYPES:
-                # Trades' ORIG_TRAN_ID is Tag-17 (ExecID) directly — a completely
-                # different derivation from Orders' recursive ClOrdID/OrigClOrdID
-                # chain (spec 5.2 "ORIG_TRAN_ID ... Tag 17 (ExecID) One To One";
-                # confirmed in TradeMapper.cs: `OriginalTransactionId = report.ExecID`).
-                trade_orig_tran_id = s.get(17)
-                if trade_orig_tran_id:
-                    sort_id_cache[trade_orig_tran_id] = sort_id_cache.get(trade_orig_tran_id, 0) + 1
-                trade_row = dict(base_row)
-                trade_row.update({
-                    "ORIG_TRAN_ID": trade_orig_tran_id,
-                    "TRAN_STATUS": TRAN_STATUS_TRADES.get(exec_type),
-                    "ORDER_REF": tag11,
-                    "BUY_SELL": {"1": "B", "2": "S"}.get(s.get(54)),
-                    "COUNTERPARTY": s.get(9068),
-                    "BOOK": s.get(5364),
-                    "PRICE": _price_for_trade_expected(s),
-                    "VOLUME": s.get(32),
-                    "FIXED_ROLLOVER": "1",
-                    "BROKER": s.get(9066),
-                    "SORT_ID": sort_id_cache.get(trade_orig_tran_id),
-                    "DELIVERY_CATEGORY": "O",
-                })
-                expected_trades.append(trade_row)
+        if exec_type in TRADES_EXEC_TYPES:
+            # Trades' ORIG_TRAN_ID is Tag-17 (ExecID) directly — a completely
+            # different derivation from Orders' recursive ClOrdID/OrigClOrdID
+            # chain (spec 5.2 "ORIG_TRAN_ID ... Tag 17 (ExecID) One To One";
+            # confirmed in TradeMapper.cs: `OriginalTransactionId = report.ExecID`).
+            base_row = _base_row(trade_variant)
+            trade_orig_tran_id = s.get(17)
+            if trade_orig_tran_id:
+                sort_id_cache[trade_orig_tran_id] = sort_id_cache.get(trade_orig_tran_id, 0) + 1
+            trade_row = dict(base_row)
+            trade_row.update({
+                "ORIG_TRAN_ID": trade_orig_tran_id,
+                "TRAN_STATUS": TRAN_STATUS_TRADES.get(exec_type),
+                "ORDER_REF": tag11,
+                "BUY_SELL": {"1": "B", "2": "S"}.get(s.get(54)),
+                "COUNTERPARTY": s.get(9068),
+                "BOOK": s.get(5364),
+                "PRICE": _price_for_trade_expected(s),
+                "VOLUME": s.get(32),
+                "FIXED_ROLLOVER": "1",
+                "BROKER": s.get(9066),
+                "SORT_ID": sort_id_cache.get(trade_orig_tran_id),
+                "DELIVERY_CATEGORY": "O",
+            })
+            expected_trades.append(trade_row)
 
     return expected_orders, expected_trades, diagnostics
