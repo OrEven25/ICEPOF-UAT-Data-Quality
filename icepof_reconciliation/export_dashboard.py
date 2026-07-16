@@ -3,7 +3,8 @@ Produces the data/YYYY-MM-DD.json payload for the "ICEPOF Reconciliation" Claude
 Design dashboard, extended (per user request) with:
   - which STG table (orders/trades) each example/lifecycle ORIG_TRAN_ID came from
   - a set of targeted raw-data links per ORIG_TRAN_ID: the specific execution
-    report(s) that make up its lifecycle, plus whichever Security Definition and/or
+    report(s) that make up its lifecycle, the actual STG (CLIENT_ORDERS/CLIENT_TRADES)
+    record(s) already booked for it, plus whichever Security Definition and/or
     User Defined Strategy message resolved its instrument (via the same linkage
     cascade the reconciliation itself uses — see targeted_export.build_targeted_links)
   - findings that touch multiple fields on the same ORIG_TRAN_ID (e.g. UNIT and
@@ -24,20 +25,23 @@ class LinkCollector:
     href, so the same (table, ORIG_TRAN_ID) pair is only computed once even if it
     appears in multiple findings."""
 
-    def __init__(self, exec_df, orig_tran_id_map, secdef_index, uds_index):
+    def __init__(self, exec_df, orig_tran_id_map, secdef_index, uds_index, actual_orders, actual_trades):
         self.exec_df = exec_df
         self.orig_tran_id_map = orig_tran_id_map
         self.secdef_index = secdef_index
         self.uds_index = uds_index
+        self.actual_orders = actual_orders
+        self.actual_trades = actual_trades
         self.csv_files: dict[str, str] = {}
         self._cache: dict[tuple[str, str], list[dict]] = {}
 
     def links_for(self, table: str, orig_tran_id: str) -> list[dict]:
         key = (table, orig_tran_id)
         if key not in self._cache:
+            actual_df = self.actual_orders if table == "orders" else self.actual_trades
             links, csv_files = build_targeted_links(
                 self.exec_df, self.orig_tran_id_map, self.secdef_index, self.uds_index,
-                table, orig_tran_id,
+                actual_df, table, orig_tran_id,
             )
             self._cache[key] = links
             self.csv_files.update(csv_files)
@@ -87,10 +91,11 @@ def _lifecycle_rows(mismatches: list[dict], links: LinkCollector) -> list[list]:
 def build_dashboard_json(*, report_date: str, orders_result: dict, trades_result: dict,
                           diagnostics: list[dict], unit_currency_finding: dict,
                           price_diff_summary: dict, notes: list[str],
-                          exec_df, orig_tran_id_map, secdef_index, uds_index) -> tuple[dict, dict[str, str]]:
+                          exec_df, orig_tran_id_map, secdef_index, uds_index,
+                          actual_orders, actual_trades) -> tuple[dict, dict[str, str]]:
     """Returns (payload, csv_files) — csv_files is {href: csv_text} to upload
     alongside the JSON."""
-    links = LinkCollector(exec_df, orig_tran_id_map, secdef_index, uds_index)
+    links = LinkCollector(exec_df, orig_tran_id_map, secdef_index, uds_index, actual_orders, actual_trades)
 
     diag_reasons: dict[str, int] = {}
     for d in diagnostics:

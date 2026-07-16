@@ -89,6 +89,23 @@ def flatten_secdef_entry_to_csv(entry, source_hint: str | None = None) -> str:
     return buf.getvalue()
 
 
+def find_stg_rows(actual_df, orig_tran_id: str):
+    """The actual staging-table row(s) (CLIENT_ORDERS or CLIENT_TRADES, whichever
+    `actual_df` is) already booked for this ORIG_TRAN_ID — i.e. what the mapper
+    actually produced, as opposed to the raw FIX input or the reference data used
+    to resolve it. Usually one row; can be >1 or 0 when this ID is also a
+    lifecycle-count mismatch (see Lifecycle integrity)."""
+    if actual_df is None:
+        return None
+    return actual_df[actual_df["ORIG_TRAN_ID"].astype(str) == str(orig_tran_id)]
+
+
+def flatten_stg_rows_to_csv(stg_rows) -> str:
+    buf = io.StringIO()
+    stg_rows.to_csv(buf, index=False)
+    return buf.getvalue()
+
+
 def flatten_uds_message_to_csv(pm, source_hint: str | None = None) -> str:
     buf = io.StringIO()
     writer = csv.writer(buf)
@@ -111,15 +128,17 @@ def flatten_uds_message_to_csv(pm, source_hint: str | None = None) -> str:
 
 
 def csv_link_for_id(orig_tran_id: str, kind: str) -> str:
-    """kind: 'exec' | 'secdef' | 'uds' — one small targeted CSV per (ID, kind)."""
+    """kind: 'exec' | 'stg' | 'secdef' | 'uds' — one small targeted CSV per (ID, kind)."""
     safe_id = str(orig_tran_id).replace("/", "_").replace(" ", "_")
     return f"raw_exports/by_id/{safe_id}_{kind}.csv"
 
 
 def build_targeted_links(exec_df, orig_tran_id_map: dict, secdef_index: dict, uds_index: dict,
-                          table: str, orig_tran_id: str) -> tuple[list[dict], dict[str, str]]:
+                          actual_df, table: str, orig_tran_id: str) -> tuple[list[dict], dict[str, str]]:
     """Returns (links: [{label, href}], csv_files: {href: csv_text}) for one
-    ORIG_TRAN_ID. `table` is 'orders' or 'trades'."""
+    ORIG_TRAN_ID. `table` is 'orders' or 'trades'. `actual_df` is the actual
+    CLIENT_ORDERS/CLIENT_TRADES DataFrame matching `table` (whatever the mapper
+    actually produced, for the STG Record link)."""
     links: list[dict] = []
     csv_files: dict[str, str] = {}
 
@@ -134,6 +153,12 @@ def build_targeted_links(exec_df, orig_tran_id_map: dict, secdef_index: dict, ud
         csv_files[href] = flatten_exec_rows_to_csv(exec_rows)
         links.append({"label": f"Execution Report{'s' if len(exec_rows) > 1 else ''} ({len(exec_rows)})", "href": href})
         tag55 = exec_rows[0][3].get(55)
+
+    stg_rows = find_stg_rows(actual_df, orig_tran_id)
+    if stg_rows is not None and not stg_rows.empty:
+        href = csv_link_for_id(orig_tran_id, "stg")
+        csv_files[href] = flatten_stg_rows_to_csv(stg_rows)
+        links.append({"label": f"STG Record{'s' if len(stg_rows) > 1 else ''} ({len(stg_rows)})", "href": href})
 
     if tag55:
         match = get_matching_instrument({55: tag55}, secdef_index, uds_index)

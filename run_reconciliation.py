@@ -153,6 +153,8 @@ def run_for_date(report_date: str):
         orig_tran_id_map=orig_tran_id_map,
         secdef_index=secdef_index,
         uds_index=uds_index,
+        actual_orders=actual_orders,
+        actual_trades=actual_trades,
     )
 
     os.makedirs(f"{DASHBOARD_EXPORT_DIR}/data", exist_ok=True)
