@@ -417,6 +417,15 @@ def _volume_for_order(exec_scalar: dict, tran_status: str | None, previous_volum
     if tran_status == "C":
         if previous_volume is not None:
             return previous_volume
+        # No earlier tracked volume means this Cancel is the first (and, per the
+        # synthetic-V-row convention, second-to-last after it) row for this order — use
+        # LeavesQty (tag151) directly, same as V/A/P, rather than OrderQty-CumQty: a
+        # single-message Cancel can carry LeavesQty=0 even when OrderQty>0 (confirmed
+        # against actual CLIENT_ORDERS, e.g. ORIG_TRAN_ID 403020900082 on 2026-07-14:
+        # OrderQty=1/CumQty=0/LeavesQty=0, actual VOLUME=0, not the 38-14 formula's 1).
+        leaves = exec_scalar.get(151)
+        if leaves is not None:
+            return leaves
         try:
             return float(exec_scalar.get(38, 0)) - float(exec_scalar.get(14, 0))
         except (TypeError, ValueError):
@@ -497,6 +506,16 @@ def build_expected_rows(exec_df: pd.DataFrame, secdef_index: dict, uds_index: di
     orig_tran_id_cache = build_orig_tran_id_map(exec_df)
     previous_volume_cache: dict[str, float] = {}
     sort_id_cache: dict[str, int] = {}
+    # We never load "orphan" order events: whichever raw message arrives first for a
+    # given ORIG_TRAN_ID/leg, the actual system always writes a full lifecycle starting
+    # with a TRAN_STATUS=V row — synthesizing one if the raw FIX stream skips straight to
+    # a later status (e.g. a marketable order whose first-arriving raw message is already
+    # the Fill, or one immediately Cancelled/Rejected with no separate New ack). Confirmed
+    # against actual CLIENT_ORDERS on 2026-07-15 (e.g. ORIG_TRAN_ID 410519700015,
+    # 19000006108083): the synthesized V row and its terminal counterpart share identical
+    # VOLUME/PRICE/TRAN_DATETIME. Tracked per (orig_tran_id, leg side) so multi-leg orders
+    # get one synthetic V per leg rather than one for the whole order.
+    seen_v_variants: set[tuple[str, int]] = set()
 
     ordered = exec_df.sort_values(["ReceivedAtUtc", "SequenceNumber"])
 
@@ -669,6 +688,20 @@ def build_expected_rows(exec_df: pd.DataFrame, secdef_index: dict, uds_index: di
                     "VOLUME": vol,
                     "DELIVERY_CATEGORY": "O",
                 })
+
+                v_key = (orig_tran_id, variant["side"])
+                if tran_status_order != "V" and v_key not in seen_v_variants:
+                    synthetic_v = dict(order_row)
+                    synthetic_v["TRAN_STATUS"] = "V"
+                    synthetic_v["_notes"] = list(order_row["_notes"]) + [
+                        "synthetic_v_row: no raw New(0) execution report seen for this "
+                        "ORIG_TRAN_ID/leg before this status — synthesized to match the "
+                        "actual system's full-lifecycle-always convention (never loads "
+                        "orphan order events)"
+                    ]
+                    expected_orders.append(synthetic_v)
+                seen_v_variants.add(v_key)
+
                 expected_orders.append(order_row)
 
         if exec_type in TRADES_EXEC_TYPES:

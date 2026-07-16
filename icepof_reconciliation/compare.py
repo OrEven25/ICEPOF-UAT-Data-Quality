@@ -78,7 +78,17 @@ def _normalize(val):
     return s
 
 
-def _group_and_sort(df: pd.DataFrame, key: str = "ORIG_TRAN_ID", time_col: str = "TRAN_DATETIME"):
+# A synthesized V row (see mapping_engine.build_expected_rows) shares its terminal
+# counterpart's exact TRAN_DATETIME, and the actual system doesn't consistently store the
+# V row before or after it (observed both ways) — so sorting on TRAN_DATETIME alone leaves
+# same-timestamp pairs in arbitrary/inconsistent relative order on the expected vs. actual
+# side, which would misalign TRAN_STATUS (and other fields) between them. Break ties with
+# a fixed lifecycle-stage rank instead, applied identically to both sides.
+_STATUS_STAGE_RANK = {"V": 0, "P": 1, "A": 2}
+
+
+def _group_and_sort(df: pd.DataFrame, key: str = "ORIG_TRAN_ID", time_col: str = "TRAN_DATETIME",
+                     status_col: str = "TRAN_STATUS"):
     groups: dict[str, list[dict]] = {}
     for _, row in df.iterrows():
         k = row.get(key)
@@ -86,7 +96,9 @@ def _group_and_sort(df: pd.DataFrame, key: str = "ORIG_TRAN_ID", time_col: str =
             continue
         groups.setdefault(str(k), []).append(row.to_dict())
     for k in groups:
-        groups[k].sort(key=lambda r: (str(r.get(time_col) or ""),))
+        groups[k].sort(key=lambda r: (
+            str(r.get(time_col) or ""), _STATUS_STAGE_RANK.get(r.get(status_col), 3),
+        ))
     return groups
 
 
