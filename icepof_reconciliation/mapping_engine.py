@@ -417,15 +417,11 @@ def _volume_for_order(exec_scalar: dict, tran_status: str | None, previous_volum
     if tran_status == "C":
         if previous_volume is not None:
             return previous_volume
-        # No earlier tracked volume means this Cancel is the first (and, per the
-        # synthetic-V-row convention, second-to-last after it) row for this order — use
-        # LeavesQty (tag151) directly, same as V/A/P, rather than OrderQty-CumQty: a
-        # single-message Cancel can carry LeavesQty=0 even when OrderQty>0 (confirmed
-        # against actual CLIENT_ORDERS, e.g. ORIG_TRAN_ID 403020900082 on 2026-07-14:
-        # OrderQty=1/CumQty=0/LeavesQty=0, actual VOLUME=0, not the 38-14 formula's 1).
-        leaves = exec_scalar.get(151)
-        if leaves is not None:
-            return leaves
+        # Spec 5.1 VOLUME row, literal: 'C' => Tag-38(OrderQty) - Tag-14(CumQty). (A
+        # prior version of this branch used LeavesQty/tag151 instead, reverse-engineered
+        # from one actual CLIENT_ORDERS example rather than the spec — that defeats the
+        # point of this tool, which is to surface real spec-vs-actual divergences, not
+        # paper over them by copying actual's behavior into "expected". Reverted.)
         try:
             return float(exec_scalar.get(38, 0)) - float(exec_scalar.get(14, 0))
         except (TypeError, ValueError):
@@ -433,6 +429,44 @@ def _volume_for_order(exec_scalar: dict, tran_status: str | None, previous_volum
     if tran_status == "E":
         return exec_scalar.get(32)
     return None
+
+
+def _spread_fields(leg1_secdef, leg2_secdef, ref: ReferenceData, today: date) -> dict | None:
+    """Time Spread / Location Spread classification for a 2-leg UUDS whose legs both
+    resolve to a SECDEF entry, per spec 'Time Spread' / 'Location Spread' / 'Time
+    Spread + Location Spread' sections (shared by Orders and Trades — neither table
+    documents any per-leg row fan-out, only these single-row field-merge rules):
+      - Time Spread: the two legs' DELIVERY_PERIOD differ -> DELIVERY_PERIOD=
+        TIME_SPREAD, TRAN_INS_TYPE=SP.
+      - Location Spread: the two legs' Tag-9302 (MARKET_AREA) differ -> MARKET_AREA
+        (and COUNTRY, if it too differs) becomes "leg1/leg2", TRAN_INS_TYPE=SP_ST.
+      - Both at once: both field-merges apply, but TRAN_INS_TYPE stays SP (confirmed
+        by the spec's own "Time Spread + Location Spread" worked example).
+    Returns None when neither condition holds (spec doesn't classify that as a
+    spread at all) — the caller then falls back to plain single-leg treatment.
+    """
+    dp1 = convert_delivery_period(leg1_secdef.get(9202), today)
+    dp2 = convert_delivery_period(leg2_secdef.get(9202), today)
+    area1, area2 = leg1_secdef.get(9302), leg2_secdef.get(9302)
+    time_spread = dp1 != dp2
+    location_spread = area1 != area2
+    if not time_spread and not location_spread:
+        return None
+
+    country_override = None
+    market_area_override = None
+    if location_spread:
+        c1 = ref.lookup_country(leg1_secdef.get(9061), leg1_secdef.fields).value
+        c2 = ref.lookup_country(leg2_secdef.get(9061), leg2_secdef.fields).value
+        country_override = f"{c1}/{c2}" if c1 != c2 else c1
+        market_area_override = f"{area1}/{area2}"
+
+    return {
+        "dp_override": "TIME_SPREAD" if time_spread else None,
+        "tran_ins_type_override": "SP" if time_spread else "SP_ST",
+        "country_override": country_override,
+        "market_area_override": market_area_override,
+    }
 
 
 def _instrument_ref_fields(secdef_entry, uds_pm, ref: ReferenceData) -> dict:
@@ -507,27 +541,30 @@ def build_expected_rows(exec_df: pd.DataFrame, secdef_index: dict, uds_index: di
     previous_volume_cache: dict[str, float] = {}
     sort_id_cache: dict[str, int] = {}
     # We never load "orphan" order events: whichever raw message arrives first for a
-    # given ORIG_TRAN_ID/leg, the actual system always writes a full lifecycle starting
+    # given ORIG_TRAN_ID, the actual system always writes a full lifecycle starting
     # with a TRAN_STATUS=V row — synthesizing one if the raw FIX stream skips straight to
     # a later status (e.g. a marketable order whose first-arriving raw message is already
     # the Fill, or one immediately Cancelled/Rejected with no separate New ack). Confirmed
     # against actual CLIENT_ORDERS on 2026-07-15 (e.g. ORIG_TRAN_ID 410519700015,
     # 19000006108083): the synthesized V row and its terminal counterpart share identical
-    # VOLUME/PRICE/TRAN_DATETIME. Tracked per (orig_tran_id, leg side) so multi-leg orders
-    # get one synthetic V per leg rather than one for the whole order.
-    seen_v_variants: set[tuple[str, int]] = set()
+    # VOLUME/PRICE/TRAN_DATETIME.
+    seen_v_variants: set[str] = set()
 
     ordered = exec_df.sort_values(["ReceivedAtUtc", "SequenceNumber"])
 
     # Drop retransmitted execution reports before building anything: ICE resends the
-    # identical business event over a backup FIX session after a session failover
-    # (tag 97=PossResend=Y observed; same ExecID/tag 17 and same trade/order economics,
-    # only the session envelope — 34/52/56/57/9/10 — differs). Confirmed on 2026-07-14
-    # data (e.g. ORIG_TRAN_ID 11000006018842): left undeduped, each resend was counted
-    # as a second independent event, inflating expected row counts. ExecID is one-to-one
-    # with a specific execution event per spec 5.2, so a repeat is a retransmission, not
-    # a new event — keep only the first-arriving copy. Messages without tag 17 (should
-    # not occur for Execution Reports, but guard anyway) are never deduped.
+    # identical business event over a backup FIX session after a session failover,
+    # flagging the resend with tag 97=PossResend=Y (same ExecID/tag 17 and same
+    # trade/order economics as the original — only the session envelope —
+    # 34/52/56/57/9/10 — differs). Confirmed on 2026-07-14 data (ExecID
+    # 11000006018842: original has no tag 97, the resend has tag97=Y).
+    #
+    # A prior version of this dedup dropped ANY repeated ExecID regardless of tag 97 —
+    # that's wrong: ExecID isn't guaranteed globally unique across unrelated orders
+    # (confirmed on 2026-07-15: ExecID 43000000033404 appears once each on ClOrdID
+    # 240157992 and 388301852, two distinct orders with different OrderQty/CumQty,
+    # neither flagged PossResend), and the blanket rule silently dropped a real
+    # Partial-Fill event for 388301852. Only drop when tag 97=Y on the repeat itself.
     seen_exec_ids: set[str] = set()
     keep_mask: list[bool] = []
     for pm in ordered["ParsedMessage"]:
@@ -535,11 +572,11 @@ def build_expected_rows(exec_df: pd.DataFrame, secdef_index: dict, uds_index: di
         if exec_id is None:
             keep_mask.append(True)
             continue
-        if exec_id in seen_exec_ids:
+        if exec_id in seen_exec_ids and pm.scalar.get(97) == "Y":
             keep_mask.append(False)
             diagnostics.append({
                 "tag11": pm.scalar.get(11),
-                "reason": f"excluded: duplicate ExecID (tag17={exec_id}) — resend/retransmission of an already-processed execution report",
+                "reason": f"excluded: duplicate ExecID (tag17={exec_id}), tag97=PossResend=Y — resend/retransmission of an already-processed execution report",
             })
         else:
             seen_exec_ids.add(exec_id)
@@ -565,74 +602,48 @@ def build_expected_rows(exec_df: pd.DataFrame, secdef_index: dict, uds_index: di
         uds_pm = link["uds"]
         is_known_uds = link["is_known_uds"]
 
-        # Build the row-set for ORDERS on this execution report: normally one row, but a
-        # UUDS (non-KUDS UDS match) fans out into multiple leg rows, unless the legs form
-        # a complete quarter or year (collapsed back to one row) or a seasonal UDS (also
-        # single row, per IsSeasonalUds). This leg-split fan-out is OrderMapper-specific —
-        # see trade_variant below, which never leg-splits.
-        row_variants: list[dict] = []  # each: {secdef_entry, uds_pm, delivery_period_override, side, notes}
+        # Build the single row-variant for this execution report. Neither the Orders nor
+        # the Trades mapping table documents any per-leg row fan-out — a UUDS strategy is
+        # always booked as exactly one row (spec 'Single Spread Mode': "only the parent
+        # strategy is saved into table"), with DELIVERY_PERIOD/MARKET_AREA/COUNTRY/
+        # TRAN_INS_TYPE merged from its legs per the Time Spread / Location Spread rules
+        # when applicable. SIDE has no transformation rule in the Orders table at all and
+        # is always 0 in actual CLIENT_ORDERS (2026-07-15: 1179/1179 rows) — confirming
+        # there's no per-leg SIDE differentiation to reconstruct.
+        variant = {"secdef": link["secdef"], "uds": uds_pm, "dp_override": None,
+                   "tran_ins_type_override": None, "notes": []}
 
         if uds_pm is not None and not is_known_uds:
             if is_seasonal_uds(uds_pm):
-                dp = convert_delivery_period(uds_pm.scalar.get(9202), today)
-                row_variants.append({"secdef": link["secdef"], "uds": uds_pm, "dp_override": dp, "side": 0, "notes": []})
+                variant["dp_override"] = convert_delivery_period(uds_pm.scalar.get(9202), today)
             else:
                 is_fq, fq_dp = is_full_quarter_uds(uds_pm, secdef_index, today)
                 is_fy, fy_dp = (False, None) if is_fq else is_full_year_uds(uds_pm, secdef_index, today)
                 if is_fq or is_fy:
-                    row_variants.append({
-                        "secdef": link["secdef"], "uds": uds_pm,
-                        "dp_override": fq_dp if is_fq else fy_dp, "side": 0,
-                        "notes": ["full_quarter_or_year_uds_collapse: code-observed behavior, not documented in spec 4.3.3/5.1.3 text"],
-                    })
+                    variant["dp_override"] = fq_dp if is_fq else fy_dp
+                    variant["notes"] = ["full_quarter_or_year_uds_collapse: code-observed behavior, not documented in spec 4.3.3/5.1.3 text"]
                 else:
-                    for i, leg in enumerate(uds_pm.legs, start=1):
-                        leg_symbol = leg.get(600)
-                        if not leg_symbol:
-                            continue
-                        leg_secdef = secdef_index.get(leg_symbol)
-                        if leg_secdef is None:
-                            continue
-                        row_variants.append({"secdef": leg_secdef, "uds": None, "dp_override": None, "side": i - 1, "notes": []})
-        else:
-            row_variants.append({"secdef": link["secdef"], "uds": uds_pm, "dp_override": None, "side": 0, "notes": []})
-
-        if not row_variants:
-            diagnostics.append({"tag11": tag11, "reason": "UUDS leg-split produced zero resolvable legs"})
-            continue
-
-        # Trades never leg-split, regardless of the ORDERS fan-out above: a multi-leg UDS
-        # trade is booked as exactly one CLIENT_TRADES row against the strategy-level
-        # instrument (not per leg). row_variants only ever has >1 entries in the UUDS
-        # leg-split branch above — every other branch (plain instrument, seasonal UDS,
-        # full-quarter/full-year collapse) already produces a single variant, which is
-        # reused as-is. Inferred from actual CLIENT_TRADES row counts on multi-leg UDS
-        # trades (e.g. ORIG_TRAN_ID 11000006018842, a 2-leg Sep26/Oct26 spread: actual=1)
-        # — not independently re-confirmed against TradeMapper.cs source, hence the note.
-        if len(row_variants) == 1:
-            trade_variant = dict(row_variants[0])
-        else:
-            # DELIVERY_PERIOD="TIME_SPREAD" / TRAN_INS_TYPE="SP" (rather than the strategy
-            # instrument's own fields) inferred from 100% of actual 2026-07-14 CLIENT_TRADES
-            # rows for multi-leg UDS trades matching this pair of literal values (e.g.
-            # ORIG_TRAN_ID 11000006018842) — not confirmed against TradeMapper.cs source.
-            # NOTE: tried generalizing this SP override to every single-row KUDS trade too
-            # (2026-07-15 showed 86 KUDS trades with actual TRAN_INS_TYPE=SP) but re-running
-            # 2026-07-13 with that broader rule flipped 28 previously-matching trades to
-            # mismatches — actual values there were ST/IT, not SP — so a KUDS instrument's
-            # TRAN_INS_TYPE isn't reliably SP; reverted to multi-leg-only, which has no
-            # counter-examples across all three days.
-            trade_variant = {
-                "secdef": link["secdef"], "uds": uds_pm, "dp_override": "TIME_SPREAD", "side": 0,
-                "tran_ins_type_override": "SP",
-                "notes": ["multileg_uds_trade_not_leg_split: TradeMapper writes one row per "
-                          "execution report regardless of leg count, unlike OrderMapper — "
-                          "inferred from actual CLIENT_TRADES row counts, not confirmed "
-                          "against TradeMapper.cs source",
-                          "multileg_uds_trade_spread_type: TRAN_INS_TYPE=SP / DELIVERY_PERIOD="
-                          "TIME_SPREAD inferred from actual CLIENT_TRADES values, not confirmed "
-                          "against TradeMapper.cs source"],
-            }
+                    leg_symbols = _leg_symbols(uds_pm)
+                    resolved_legs = [secdef_index[sym] for sym in leg_symbols if sym in secdef_index]
+                    spread = _spread_fields(resolved_legs[0], resolved_legs[1], ref, today) if len(resolved_legs) == 2 else None
+                    if spread is not None:
+                        variant.update({
+                            "dp_override": spread["dp_override"],
+                            "tran_ins_type_override": spread["tran_ins_type_override"],
+                            "country_override": spread["country_override"],
+                            "market_area_override": spread["market_area_override"],
+                            "notes": ["uds_spread: Time Spread / Location Spread field merge per spec, "
+                                      "no per-leg row fan-out"],
+                        })
+                    else:
+                        variant["notes"] = [
+                            f"multileg_uds_unclassified: {len(uds_pm.legs)}-leg UDS that isn't "
+                            "seasonal/full-quarter/full-year and (with 2 resolvable legs) doesn't "
+                            "meet the Time/Location Spread differing-value conditions, or doesn't "
+                            "have exactly 2 resolvable legs — spec's Orders/Trades tables don't "
+                            "cover this case explicitly; using the first resolvable leg's own "
+                            "instrument fields for a single row"
+                        ]
 
         def _base_row(variant):
             secdef_entry = variant["secdef"]
@@ -650,9 +661,9 @@ def build_expected_rows(exec_df: pd.DataFrame, secdef_index: dict, uds_index: di
             return {
                 "_tag11": tag11,
                 "ORIG_TRAN_ID": orig_tran_id,
-                "COUNTRY": inst["country"], "_country_step": inst["country_step"],
+                "COUNTRY": variant.get("country_override") or inst["country"], "_country_step": inst["country_step"],
                 "COMMODITY": inst["commodity"], "_commodity_step": inst["commodity_step"],
-                "MARKET_AREA": inst["market_area"],
+                "MARKET_AREA": variant.get("market_area_override") or inst["market_area"],
                 "DELIVERY_PERIOD": delivery_period,
                 "TRAN_INS_TYPE": tran_ins_type,
                 "INS_CLASS": "F",
@@ -663,7 +674,7 @@ def build_expected_rows(exec_df: pd.DataFrame, secdef_index: dict, uds_index: di
                 "TRADER": s.get(9139),
                 "TRAN_DATETIME": s.get(60),
                 "LINKED_TRAN_ID": tag11 or tag41,
-                "SIDE": variant["side"],
+                "SIDE": 0,
                 "_link_type": link["link_type"],
                 "_is_known_uds": is_known_uds,
                 "_notes": notes,
@@ -673,43 +684,41 @@ def build_expected_rows(exec_df: pd.DataFrame, secdef_index: dict, uds_index: di
         tran_status_order = TRAN_STATUS_ORDERS.get(exec_type, "C") if tag9175 in ("0", "4", "5", "6") else "C"
 
         if exec_type in ORDERS_EXEC_TYPES:
-            for variant in row_variants:
-                base_row = _base_row(variant)
-                secdef_entry = variant["secdef"]
-                prev_vol = previous_volume_cache.get(orig_tran_id)
-                vol = _volume_for_order(s, tran_status_order, prev_vol)
-                previous_volume_cache[orig_tran_id] = vol
-                order_row = dict(base_row)
-                order_row.update({
-                    "TRAN_STATUS": tran_status_order,
-                    "BID_ASK": {"1": "B", "2": "A"}.get(s.get(54)),
-                    "ORDER_TYPE": _order_type(s),
-                    "PRICE": _price_for_order(s, secdef_entry),
-                    "VOLUME": vol,
-                    "DELIVERY_CATEGORY": "O",
-                })
+            base_row = _base_row(variant)
+            secdef_entry = variant["secdef"]
+            prev_vol = previous_volume_cache.get(orig_tran_id)
+            vol = _volume_for_order(s, tran_status_order, prev_vol)
+            previous_volume_cache[orig_tran_id] = vol
+            order_row = dict(base_row)
+            order_row.update({
+                "TRAN_STATUS": tran_status_order,
+                "BID_ASK": {"1": "B", "2": "A"}.get(s.get(54)),
+                "ORDER_TYPE": _order_type(s),
+                "PRICE": _price_for_order(s, secdef_entry),
+                "VOLUME": vol,
+                "DELIVERY_CATEGORY": "O",
+            })
 
-                v_key = (orig_tran_id, variant["side"])
-                if tran_status_order != "V" and v_key not in seen_v_variants:
-                    synthetic_v = dict(order_row)
-                    synthetic_v["TRAN_STATUS"] = "V"
-                    synthetic_v["_notes"] = list(order_row["_notes"]) + [
-                        "synthetic_v_row: no raw New(0) execution report seen for this "
-                        "ORIG_TRAN_ID/leg before this status — synthesized to match the "
-                        "actual system's full-lifecycle-always convention (never loads "
-                        "orphan order events)"
-                    ]
-                    expected_orders.append(synthetic_v)
-                seen_v_variants.add(v_key)
+            if tran_status_order != "V" and orig_tran_id not in seen_v_variants:
+                synthetic_v = dict(order_row)
+                synthetic_v["TRAN_STATUS"] = "V"
+                synthetic_v["_notes"] = list(order_row["_notes"]) + [
+                    "synthetic_v_row: no raw New(0) execution report seen for this "
+                    "ORIG_TRAN_ID before this status — synthesized to match the "
+                    "actual system's full-lifecycle-always convention (never loads "
+                    "orphan order events)"
+                ]
+                expected_orders.append(synthetic_v)
+            seen_v_variants.add(orig_tran_id)
 
-                expected_orders.append(order_row)
+            expected_orders.append(order_row)
 
         if exec_type in TRADES_EXEC_TYPES:
             # Trades' ORIG_TRAN_ID is Tag-17 (ExecID) directly — a completely
             # different derivation from Orders' recursive ClOrdID/OrigClOrdID
             # chain (spec 5.2 "ORIG_TRAN_ID ... Tag 17 (ExecID) One To One";
             # confirmed in TradeMapper.cs: `OriginalTransactionId = report.ExecID`).
-            base_row = _base_row(trade_variant)
+            base_row = _base_row(variant)
             trade_orig_tran_id = s.get(17)
             if trade_orig_tran_id:
                 sort_id_cache[trade_orig_tran_id] = sort_id_cache.get(trade_orig_tran_id, 0) + 1
