@@ -591,12 +591,18 @@ def build_expected_rows(exec_df: pd.DataFrame, secdef_index: dict, uds_index: di
         # trades (e.g. ORIG_TRAN_ID 11000006018842, a 2-leg Sep26/Oct26 spread: actual=1)
         # — not independently re-confirmed against TradeMapper.cs source, hence the note.
         if len(row_variants) == 1:
-            trade_variant = row_variants[0]
+            trade_variant = dict(row_variants[0])
         else:
             # DELIVERY_PERIOD="TIME_SPREAD" / TRAN_INS_TYPE="SP" (rather than the strategy
             # instrument's own fields) inferred from 100% of actual 2026-07-14 CLIENT_TRADES
             # rows for multi-leg UDS trades matching this pair of literal values (e.g.
             # ORIG_TRAN_ID 11000006018842) — not confirmed against TradeMapper.cs source.
+            # NOTE: tried generalizing this SP override to every single-row KUDS trade too
+            # (2026-07-15 showed 86 KUDS trades with actual TRAN_INS_TYPE=SP) but re-running
+            # 2026-07-13 with that broader rule flipped 28 previously-matching trades to
+            # mismatches — actual values there were ST/IT, not SP — so a KUDS instrument's
+            # TRAN_INS_TYPE isn't reliably SP; reverted to multi-leg-only, which has no
+            # counter-examples across all three days.
             trade_variant = {
                 "secdef": link["secdef"], "uds": uds_pm, "dp_override": "TIME_SPREAD", "side": 0,
                 "tran_ins_type_override": "SP",
