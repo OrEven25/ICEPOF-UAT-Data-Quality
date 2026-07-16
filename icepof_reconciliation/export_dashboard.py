@@ -10,6 +10,12 @@ Design dashboard, extended (per user request) with:
   - findings that touch multiple fields on the same ORIG_TRAN_ID (e.g. UNIT and
     CURRENCY both wrong on the same trade) are merged into ONE row instead of
     repeating ORIG_TRAN_ID/Table/Source once per field.
+  - a mandatory-field-population check (compare.build_mandatory_field_gaps) run
+    directly against the actual CLIENT_ORDERS/CLIENT_TRADES output — independent
+    of whether we can reconstruct an "expected" value for a field, several
+    mandatory fields (SORT_ID, PARTY, SOURCE, TIMEZONE, ORIGIN, ORIG_INS_TYPE,
+    INS_TYPE) are excluded from the field-mismatch comparison entirely, so this
+    is the only place a silent null/blank gap in one of those would surface.
 
 Also returns the full set of {href: csv_text} to upload (collected while building the
 rows, since each targeted CSV is generated once per referenced ORIG_TRAN_ID).
@@ -17,6 +23,7 @@ rows, since each targeted CSV is generated once per referenced ORIG_TRAN_ID).
 
 from __future__ import annotations
 
+from .compare import MANDATORY_FIELDS_ORDERS, MANDATORY_FIELDS_TRADES, build_mandatory_field_gaps
 from .targeted_export import build_targeted_links
 
 
@@ -76,6 +83,27 @@ def _merge_examples_by_id(field_examples: list[tuple[str, list[dict]]], links: L
     return rows
 
 
+def _mandatory_gap_rows(gaps: list[dict], links: LinkCollector) -> list[dict]:
+    """One entry per (table, field) with at least one blank row, carrying a capped
+    sample of affected ORIG_TRAN_IDs with the same targeted raw-data links used
+    everywhere else — so a gap in a field like SORT_ID or PARTY (both excluded from
+    the field-mismatch comparison entirely) is still drillable down to raw FIX."""
+    out = []
+    for g in gaps:
+        if g["missing"] == 0 or g["column_absent"]:
+            continue
+        table_label = "Orders" if g["table"] == "orders" else "Trades"
+        sample_rows = [
+            {"cells": [oid, table_label], "links": links.links_for(g["table"], oid)}
+            for oid in g["examples"]
+        ]
+        out.append({
+            "field": g["field"], "table": g["table"], "missing": g["missing"], "total": g["total"],
+            "sampleRows": sample_rows,
+        })
+    return out
+
+
 def _lifecycle_rows(mismatches: list[dict], links: LinkCollector) -> list[list]:
     rows = []
     for m in mismatches[:15]:
@@ -107,6 +135,9 @@ def build_dashboard_json(*, report_date: str, orders_result: dict, trades_result
         ("CURRENCY", unit_currency_finding["currency_examples"]),
     ], links)
     price_rows = _merge_examples_by_id([("PRICE", price_diff_summary["examples"])], links)
+
+    mandatory_orders = build_mandatory_field_gaps(actual_orders, MANDATORY_FIELDS_ORDERS, "orders")
+    mandatory_trades = build_mandatory_field_gaps(actual_trades, MANDATORY_FIELDS_TRADES, "trades")
 
     findings = [
         {
@@ -173,6 +204,18 @@ def build_dashboard_json(*, report_date: str, orders_result: dict, trades_result
         "unresolved": {
             "total": len(diagnostics),
             "reasons": [[k, v] for k, v in diag_reasons.items()],
+        },
+        "mandatoryFields": {
+            "orderTotal": len(actual_orders),
+            "tradeTotal": len(actual_trades),
+            "orders": [[g["field"], g["missing"]] for g in
+                       sorted(mandatory_orders, key=lambda g: -g["missing"])],
+            "trades": [[g["field"], g["missing"]] for g in
+                       sorted(mandatory_trades, key=lambda g: -g["missing"])],
+            "orderGaps": _mandatory_gap_rows(
+                sorted(mandatory_orders, key=lambda g: -g["missing"]), links),
+            "tradeGaps": _mandatory_gap_rows(
+                sorted(mandatory_trades, key=lambda g: -g["missing"]), links),
         },
         "notes": notes,
     }

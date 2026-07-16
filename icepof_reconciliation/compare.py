@@ -42,6 +42,63 @@ NOT_VALIDATED_TRADES = [
     "COUNTERPARTY",
 ]
 
+# Mandatory-field population check: fields the STG mapping tables (5.1/5.2) mark
+# Mandatory=Y (or, for Orders, leave the column blank but clearly load-bearing —
+# e.g. ORIG_TRAN_ID/TRAN_STATUS) should never be null/blank in the actual
+# CLIENT_ORDERS/CLIENT_TRADES output, independent of whether we can reconstruct an
+# "expected" value for them (several of these — SORT_ID, PARTY, SOURCE, TIMEZONE,
+# ORIGIN, ORIG_INS_TYPE, INS_TYPE — are in NOT_VALIDATED_* above and so never
+# surface in the field-mismatch comparison at all; this check is the only place
+# a silent gap in one of those would be caught).
+MANDATORY_FIELDS_BOTH = [
+    "TRAN_STATUS", "COUNTRY", "COMMODITY", "DELIVERY_PERIOD", "TRAN_INS_TYPE",
+    "INS_CLASS", "INS_TYPE", "TRADER", "ORIGIN", "ORIG_TRAN_ID", "SIDE", "SORT_ID",
+    "TRAN_DATETIME", "TIMEZONE", "VOLUME", "UNIT", "PRICE", "CURRENCY", "PARTY",
+    "SOURCE", "ORIG_INS_TYPE", "DELIVERY_CATEGORY",
+]
+MANDATORY_FIELDS_ORDERS = MANDATORY_FIELDS_BOTH + ["ORDER_TYPE", "BID_ASK"]
+MANDATORY_FIELDS_TRADES = MANDATORY_FIELDS_BOTH + ["BUY_SELL"]
+
+
+def _is_blank(value) -> bool:
+    if value is None:
+        return True
+    try:
+        if pd.isna(value):
+            return True
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, str) and value.strip() == "":
+        return True
+    return False
+
+
+def build_mandatory_field_gaps(actual_df: pd.DataFrame, fields: list[str], table_name: str) -> list[dict]:
+    """For each mandatory field, how many actual rows have it null/blank. Includes
+    fields with zero gaps too (mirrors the field-mismatch tables, which likewise
+    keep zero-rate fields in the data and let the dashboard's hide-zero toggle
+    filter them) so a field going from populated to unpopulated is visible as soon
+    as it happens, not only once it already has gaps."""
+    total = len(actual_df)
+    results = []
+    for field in fields:
+        if field not in actual_df.columns:
+            results.append({
+                "field": field, "table": table_name, "missing": total, "total": total,
+                "column_absent": True, "examples": [],
+            })
+            continue
+        blank_mask = actual_df[field].apply(_is_blank)
+        missing = int(blank_mask.sum())
+        examples = []
+        if missing and "ORIG_TRAN_ID" in actual_df.columns:
+            examples = actual_df.loc[blank_mask, "ORIG_TRAN_ID"].astype(str).unique()[:10].tolist()
+        results.append({
+            "field": field, "table": table_name, "missing": missing, "total": total,
+            "column_absent": False, "examples": examples,
+        })
+    return results
+
 
 def _normalize(val):
     """Canonicalize a value from either side (raw FIX string on the expected side,
