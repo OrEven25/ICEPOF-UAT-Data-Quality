@@ -166,6 +166,35 @@ def _traverse_nested_uds(uds_pm, leg_symbols: list[str], secdef_index: dict, uds
     return None, None
 
 
+def _resolve_leg_to_secdef(leg_symbol: str, secdef_index: dict, uds_index: dict):
+    """A UDS leg's own LegSymbol (tag 600) can itself be another UDS/strategy symbol
+    rather than a direct SECDEF instrument — e.g. ICE's 'Futures Today' front-month
+    UDS wraps a single daily contract rather than exposing it directly (confirmed on
+    2026-07-16: leg symbol 400431 is a 1-leg 'Futures Today' UDS whose own leg
+    resolves to SECDEF 8978816, '16 Jul 26 EUA Daily'). Follows single-leg nested
+    UDS chains up to the same depth cap used elsewhere (MaxTraversalDepth=10);
+    bails out (returns None) on a nested UDS with more than one leg — spec gives no
+    guidance for resolving which of several nested legs would apply here, so this
+    is left unresolved (surfaces as 'doesn't have exactly 2 resolvable legs' in the
+    multileg-unclassified note) rather than guessed."""
+    symbol = leg_symbol
+    seen = set()
+    for _ in range(MAX_UDS_TRAVERSAL_DEPTH):
+        entry = secdef_index.get(symbol)
+        if entry is not None:
+            return entry
+        if symbol in seen:
+            return None
+        seen.add(symbol)
+        nested = uds_index.get(symbol)
+        if nested is None or len(nested.legs) != 1:
+            return None
+        symbol = nested.legs[0].get(600)
+        if symbol is None:
+            return None
+    return None
+
+
 def get_matching_instrument(exec_scalar: dict, secdef_index: dict, uds_index: dict):
     """
     Returns dict: link_type ('secdef_direct'|'uds'|'unresolved'), secdef (SecurityEntry
@@ -229,14 +258,14 @@ def is_seasonal_uds(uds_pm) -> bool:
     return bool(re.match(r"^(Winter|Summer)\d{2}$", strip_name, re.IGNORECASE))
 
 
-def leg_delivery_period(leg_symbol: str, secdef_index: dict, today: date) -> str | None:
-    entry = secdef_index.get(leg_symbol)
+def leg_delivery_period(leg_symbol: str, secdef_index: dict, today: date, uds_index: dict | None = None) -> str | None:
+    entry = secdef_index.get(leg_symbol) if uds_index is None else _resolve_leg_to_secdef(leg_symbol, secdef_index, uds_index)
     if entry is None:
         return None
     return convert_delivery_period(entry.get(9202), today)
 
 
-def is_full_quarter_uds(uds_pm, secdef_index: dict, today: date) -> tuple[bool, str | None]:
+def is_full_quarter_uds(uds_pm, secdef_index: dict, today: date, uds_index: dict | None = None) -> tuple[bool, str | None]:
     legs = uds_pm.legs
     if not (3 <= len(legs) <= 4):
         return False, None
@@ -245,7 +274,7 @@ def is_full_quarter_uds(uds_pm, secdef_index: dict, today: date) -> tuple[bool, 
         leg_symbol = leg.get(600)
         if not leg_symbol:
             return False, None
-        dp = leg_delivery_period(leg_symbol, secdef_index, today)
+        dp = leg_delivery_period(leg_symbol, secdef_index, today, uds_index)
         if dp is None:
             return False, None
         delivery_periods.append(dp)
@@ -279,7 +308,7 @@ def is_full_quarter_uds(uds_pm, secdef_index: dict, today: date) -> tuple[bool, 
     return True, f"Q{quarters.pop()}{first_year}"
 
 
-def is_full_year_uds(uds_pm, secdef_index: dict, today: date) -> tuple[bool, str | None]:
+def is_full_year_uds(uds_pm, secdef_index: dict, today: date, uds_index: dict | None = None) -> tuple[bool, str | None]:
     legs = uds_pm.legs
     if len(legs) != 12:
         return False, None
@@ -288,7 +317,7 @@ def is_full_year_uds(uds_pm, secdef_index: dict, today: date) -> tuple[bool, str
         leg_symbol = leg.get(600)
         if not leg_symbol:
             return False, None
-        dp = leg_delivery_period(leg_symbol, secdef_index, today)
+        dp = leg_delivery_period(leg_symbol, secdef_index, today, uds_index)
         if dp is None:
             return False, None
         delivery_periods.add(dp)
@@ -444,9 +473,24 @@ def _spread_fields(leg1_secdef, leg2_secdef, ref: ReferenceData, today: date) ->
         by the spec's own "Time Spread + Location Spread" worked example).
     Returns None when neither condition holds (spec doesn't classify that as a
     spread at all) — the caller then falls back to plain single-leg treatment.
+
+    Also returns None when EITHER leg's own DELIVERY_PERIOD is undefined (e.g. a
+    "Futures Today" front-day leg whose delivery date is today or earlier — spec's
+    Daily/RD rule returns Null in that case). A None-vs-real comparison isn't a
+    meaningful "differs" signal, and production itself is inconsistent here:
+    2026-07-15 ORIG_TRAN_ID 240157992 and 2026-07-16 ORIG_TRAN_ID 705002809 are
+    both a structurally identical "Futures Today/Dec26" 2-leg UDS (same leg
+    symbols), yet the former lands as TRAN_INS_TYPE=ST/DELIVERY_PERIOD=blank and
+    the latter as SP/TIME_SPREAD — there's no rule derivable from the data that
+    gets both right, so this case is deliberately left unclassified rather than
+    guessed. Every 2-leg UDS with two REAL (non-null) delivery periods classified
+    correctly (23/23 IDs on 2026-07-15, 100%), confirming the rule is sound once
+    this ambiguous edge case is excluded.
     """
     dp1 = convert_delivery_period(leg1_secdef.get(9202), today)
     dp2 = convert_delivery_period(leg2_secdef.get(9202), today)
+    if dp1 is None or dp2 is None:
+        return None
     area1, area2 = leg1_secdef.get(9302), leg2_secdef.get(9302)
     time_spread = dp1 != dp2
     location_spread = area1 != area2
@@ -617,14 +661,16 @@ def build_expected_rows(exec_df: pd.DataFrame, secdef_index: dict, uds_index: di
             if is_seasonal_uds(uds_pm):
                 variant["dp_override"] = convert_delivery_period(uds_pm.scalar.get(9202), today)
             else:
-                is_fq, fq_dp = is_full_quarter_uds(uds_pm, secdef_index, today)
-                is_fy, fy_dp = (False, None) if is_fq else is_full_year_uds(uds_pm, secdef_index, today)
+                is_fq, fq_dp = is_full_quarter_uds(uds_pm, secdef_index, today, uds_index)
+                is_fy, fy_dp = (False, None) if is_fq else is_full_year_uds(uds_pm, secdef_index, today, uds_index)
                 if is_fq or is_fy:
                     variant["dp_override"] = fq_dp if is_fq else fy_dp
                     variant["notes"] = ["full_quarter_or_year_uds_collapse: code-observed behavior, not documented in spec 4.3.3/5.1.3 text"]
                 else:
                     leg_symbols = _leg_symbols(uds_pm)
-                    resolved_legs = [secdef_index[sym] for sym in leg_symbols if sym in secdef_index]
+                    resolved_legs = [e for e in (
+                        _resolve_leg_to_secdef(sym, secdef_index, uds_index) for sym in leg_symbols
+                    ) if e is not None]
                     spread = _spread_fields(resolved_legs[0], resolved_legs[1], ref, today) if len(resolved_legs) == 2 else None
                     if spread is not None:
                         variant.update({
